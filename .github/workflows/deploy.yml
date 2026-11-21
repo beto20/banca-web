@@ -1,0 +1,72 @@
+name: Deploy banca-web to GKE
+
+# Independent pipeline for the frontend (Angular + Nginx).
+# Builds the image, pushes to Artifact Registry, and rolls out the banca-web
+# Deployment. Cluster resources are bootstrapped once with `kubectl apply -k k8s/`.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# Required for keyless auth via Workload Identity Federation.
+permissions:
+  contents: read
+  id-token: write
+
+env:
+  AR_REGION: ${{ vars.AR_REGION }}       # e.g. us-central1
+  AR_REPO: ${{ vars.AR_REPO }}           # e.g. lumina
+  K8S_NAMESPACE: lumina
+  DEPLOYMENT: banca-web
+  CONTAINER: banca-web
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Authenticate to Google Cloud (WIF, keyless)
+        uses: google-github-actions/auth@v2
+        with:
+          project_id: ${{ vars.GCP_PROJECT_ID }}
+          workload_identity_provider: ${{ vars.GCP_WIF_PROVIDER }}
+          service_account: ${{ vars.GCP_DEPLOY_SA }}
+
+      - name: Set up gcloud
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Install GKE auth plugin
+        run: gcloud components install gke-gcloud-auth-plugin --quiet
+
+      - name: Configure Docker for Artifact Registry
+        run: gcloud auth configure-docker "${AR_REGION}-docker.pkg.dev" --quiet
+
+      - name: Build & push image
+        id: image
+        run: |
+          IMAGE="${AR_REGION}-docker.pkg.dev/${{ vars.GCP_PROJECT_ID }}/${AR_REPO}/${CONTAINER}:${GITHUB_SHA}"
+          docker build --platform linux/amd64 -t "$IMAGE" .
+          docker push "$IMAGE"
+          echo "image=$IMAGE" >> "$GITHUB_OUTPUT"
+
+      - name: Discover GKE cluster via gcloud
+        env:
+          USE_GKE_GCLOUD_AUTH_PLUGIN: "True"
+        run: |
+          CLUSTER=$(gcloud container clusters list --format='value(name)' --limit=1)
+          LOCATION=$(gcloud container clusters list --format='value(location)' --limit=1)
+          if [ -z "$CLUSTER" ]; then echo "No GKE cluster found in project"; exit 1; fi
+          echo ">> Target cluster: $CLUSTER ($LOCATION)"
+          gcloud container clusters get-credentials "$CLUSTER" --location "$LOCATION"
+
+      - name: Roll out new image
+        env:
+          USE_GKE_GCLOUD_AUTH_PLUGIN: "True"
+        run: |
+          kubectl -n "$K8S_NAMESPACE" set image \
+            "deployment/${DEPLOYMENT}" "${CONTAINER}=${{ steps.image.outputs.image }}"
+          kubectl -n "$K8S_NAMESPACE" rollout status \
+            "deployment/${DEPLOYMENT}" --timeout=180s
